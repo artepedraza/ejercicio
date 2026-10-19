@@ -39,8 +39,17 @@
   // ---------- storage ----------
   var S, D = null;
 
-  function seedState() { return { v: VERSION, routines: clone(window.SEED_ROUTINES), sessions: [] }; }
-  function migrate(st) { st.v = VERSION; return st; }
+  var EPOCH = '1970-01-01T00:00:00.000Z'; // updatedAt de un estado nunca editado (semilla)
+  function seedState() { return { v: VERSION, updatedAt: EPOCH, routines: clone(window.SEED_ROUTINES), sessions: [] }; }
+  function migrate(st) {
+    st.v = VERSION;
+    if (typeof st.updatedAt !== 'string' || isNaN(new Date(st.updatedAt))) {
+      var last = EPOCH;
+      (st.sessions || []).forEach(function (s) { if (typeof s.date === 'string' && s.date > last) last = s.date; });
+      st.updatedAt = last;
+    }
+    return st;
+  }
   function load() {
     try {
       var raw = localStorage.getItem(STATE_KEY);
@@ -73,6 +82,13 @@
   S = load();
   D = loadDraft();
   if (!localStorage.getItem(STATE_KEY)) save();
+  // Cambio real: sube updatedAt, guarda y (si hay sync configurada) manda a la nube.
+  function commit() {
+    S.updatedAt = new Date().toISOString();
+    if (!save()) return false;
+    if (typeof syncChanged === 'function') syncChanged();
+    return true;
+  }
 
   // ---------- dominio ----------
   function routineById(id) { return S.routines.filter(function (r) { return r.id === id; })[0]; }
@@ -197,6 +213,14 @@
       '<button class="btn" data-act="import-text" data-testid="import-text-ok">Importar texto</button></details>' +
       '<p class="muted" style="margin-bottom:0" data-testid="backup-line">Último respaldo: ' + (lastBk ? esc(fmtDate(lastBk)) : 'nunca') +
       ' · Instálala en tu pantalla de inicio.</p></div>';
+    h += '<div class="card"><h2 style="margin-top:0">Sincronizar con Google Sheets</h2>' +
+      '<p class="muted" style="margin-top:0" data-testid="sync-status">' + esc(syncText()) + '</p>' +
+      '<input type="url" style="width:100%;margin-bottom:8px" placeholder="URL de la aplicación web (termina en /exec)" autocomplete="off" value="' + esc(SY ? SY.url : '') + '" data-testid="sync-url">' +
+      '<input type="password" style="width:100%;margin-bottom:8px" placeholder="Token" autocomplete="off" value="' + esc(SY ? SY.token : '') + '" data-testid="sync-token">' +
+      '<div class="row wrap"><button class="btn grow" data-act="sync-save" data-testid="sync-save">Guardar</button>' +
+      (SY ? '<button class="btn grow" data-act="sync-now" data-testid="sync-now">Sincronizar ahora</button>' +
+        '<button class="btn danger grow" data-act="sync-off" data-testid="sync-off">Desconectar</button>' : '') +
+      '</div></div>';
     $app.innerHTML = h;
   }
 
@@ -333,7 +357,7 @@
       extrasDone: D.extrasDone.slice(), sets: sets, finished: true
     };
     S.sessions.push(session);
-    if (!save()) { S.sessions.pop(); return; }
+    if (!commit()) { S.sessions.pop(); return; }
     D = null; saveDraftNow();
     location.hash = '#/resumen/' + session.id;
   }
@@ -545,7 +569,7 @@
     });
     var i = S.routines.findIndex(function (r) { return r.id === E.id; });
     S.routines[i] = clone(E);
-    if (save()) { toast('Guardado.'); E = null; location.hash = '#/editar'; }
+    if (commit()) { toast('Guardado.'); E = null; location.hash = '#/editar'; }
   }
 
   // ---------- export / import ----------
@@ -671,10 +695,151 @@
         try { localStorage.setItem(BACKUP_KEY, JSON.stringify(S)); } catch (e) { /* si no cabe, seguimos */ }
         S = migrate(st);
         D = null; E = null; saveDraftNow();
-        if (save()) { toast('Respaldo importado.'); if (location.hash && location.hash !== '#/') location.hash = '#/'; else render(); }
+        if (commit()) { toast('Respaldo importado.'); if (location.hash && location.hash !== '#/') location.hash = '#/'; else render(); }
       });
     }
   }
+
+  // ---------- sincronización con Google Sheets (opcional) ----------
+  // Config propia en localStorage (fuera del state y del respaldo). Sin config: cero requests.
+  var SYNC_KEY = 'ejt:sync';
+  var SY = null, syncMsg = null, syncBusy = false, syncAgain = false, rev = 0;
+  try { SY = JSON.parse(localStorage.getItem(SYNC_KEY)); } catch (e) { SY = null; }
+  if (!SY || !SY.url || !SY.token) SY = null;
+
+  function saveSY() { try { localStorage.setItem(SYNC_KEY, JSON.stringify(SY)); } catch (e) { /* nada */ } }
+  function hhmm(iso) { var d = new Date(iso); return isNaN(d) ? '' : d.toLocaleTimeString('es-MX', { hour: '2-digit', minute: '2-digit' }); }
+  function syncText() {
+    if (!SY) return 'Solo en este teléfono';
+    if (syncMsg) return syncMsg;
+    if (SY.pending) return 'Pendiente de subir (sin conexión)';
+    return SY.last ? 'Sincronizado ' + hhmm(SY.last) : 'Conectado, sin sincronizar todavía';
+  }
+  function setSyncMsg(m) {
+    syncMsg = m;
+    var el = document.querySelector('[data-testid="sync-status"]');
+    if (el) el.textContent = syncText();
+  }
+  function isPristine() { return !S.sessions.length && S.updatedAt === EPOCH; }
+
+  function call(method, body) {
+    var ctl = typeof AbortController === 'function' ? new AbortController() : null;
+    var timer = ctl && setTimeout(function () { ctl.abort(); }, 25000);
+    var url = SY.url, opts = { redirect: 'follow', credentials: 'omit', cache: 'no-store', signal: ctl ? ctl.signal : undefined };
+    if (method === 'GET') {
+      url += (url.indexOf('?') < 0 ? '?' : '&') + 'action=pull&token=' + encodeURIComponent(SY.token);
+    } else {
+      opts.method = 'POST';
+      // text/plain = solicitud simple de CORS (sin preflight); el token va dentro del body.
+      opts.headers = { 'Content-Type': 'text/plain;charset=utf-8' };
+      opts.body = JSON.stringify(body);
+    }
+    return fetch(url, opts).then(function (res) {
+      return res.text();
+    }).then(function (t) {
+      var j;
+      try { j = JSON.parse(t); } catch (e) { throw new Error('respuesta inválida del servidor'); }
+      return j;
+    }).then(function (j) { clearTimeout(timer); return j; }, function (e) { clearTimeout(timer); throw e; });
+  }
+
+  function adopt(remote) {
+    var err = validate(remote);
+    if (err) throw new Error('el respaldo en la nube es inválido');
+    S = migrate(remote);
+    save();
+    var h = location.hash || '#/';
+    if (h.indexOf('#/sesion') !== 0 && h.indexOf('#/editar/') !== 0) render();
+  }
+  function mergeRemote(remote) {
+    var err = validate(remote);
+    if (err) throw new Error('el respaldo en la nube es inválido');
+    var have = {};
+    S.sessions.forEach(function (s) { have[s.id] = 1; });
+    remote.sessions.forEach(function (s) { if (!have[s.id]) S.sessions.push(s); });
+    if (remote.updatedAt > S.updatedAt) S.routines = remote.routines;
+    S.updatedAt = new Date().toISOString();
+    rev++;
+    save();
+    var h = location.hash || '#/';
+    if (h.indexOf('#/sesion') !== 0 && h.indexOf('#/editar/') !== 0) render();
+  }
+
+  function push(tries) {
+    var myRev = rev;
+    return call('POST', { token: SY.token, action: 'push', state: S }).then(function (r) {
+      if (r.conflict && r.state) {
+        if (tries >= 3) throw new Error('conflicto sin resolver, intenta de nuevo');
+        mergeRemote(r.state);
+        return push(tries + 1);
+      }
+      if (!r.ok) throw new Error(r.error || 'error desconocido');
+      if (rev === myRev) SY.pending = false;
+      SY.last = new Date().toISOString();
+    });
+  }
+
+  // Reconciliar: pull y decidir quién gana.
+  function reconcile() {
+    return call('GET').then(function (r) {
+      if (!r.ok) throw new Error(r.error || 'error desconocido');
+      var remote = r.state;
+      if (!remote) {
+        if (isPristine()) { SY.pending = false; SY.last = new Date().toISOString(); return; }
+        return push(0);
+      }
+      var ru = String(remote.updatedAt || r.updatedAt || '');
+      remote.updatedAt = ru;
+      if (isPristine()) { adopt(remote); SY.pending = false; SY.last = new Date().toISOString(); return; }
+      if (ru > S.updatedAt) {
+        if (SY.pending) { mergeRemote(remote); return push(0); }
+        adopt(remote); SY.last = new Date().toISOString(); return;
+      }
+      if (ru < S.updatedAt || SY.pending) return push(0);
+      SY.pending = false; SY.last = new Date().toISOString();
+    });
+  }
+
+  // mode: 'push' (tras un cambio) o 'pull' (abrir, online, visible, botón)
+  function runSync(mode) {
+    if (!SY) return Promise.resolve();
+    if (syncBusy) { syncAgain = true; return Promise.resolve(); }
+    syncBusy = true;
+    setSyncMsg('Sincronizando…');
+    return (mode === 'push' ? push(0) : reconcile()).then(function () {
+      setSyncMsg(null);
+    }, function (e) {
+      var net = e instanceof TypeError || (e && e.name === 'AbortError');
+      var pend = SY && SY.pending;
+      var err = 'Error: ' + (e && e.message === 'unauthorized' ? 'token incorrecto' : (e && e.message || e));
+      setSyncMsg(net ? (pend ? 'Pendiente de subir (sin conexión)' : 'Sin conexión') : (pend ? 'Pendiente de subir. ' + err : err));
+    }).then(function () {
+      syncBusy = false;
+      if (SY) saveSY();
+      if (syncAgain) { syncAgain = false; runSync('pull'); }
+    });
+  }
+  function syncChanged() {
+    if (!SY) return;
+    rev++; SY.pending = true; saveSY();
+    runSync('push');
+  }
+  function syncNow() { return runSync('pull'); }
+  function syncSave() {
+    var url = document.querySelector('[data-testid="sync-url"]').value.trim();
+    var token = document.querySelector('[data-testid="sync-token"]').value.trim();
+    if (!/^https?:\/\/\S+$/.test(url) || !token) { toast('Pon la URL (https://…/exec) y el token.'); return; }
+    // pending=true: la primera vez se mezcla con lo que ya haya en la nube, no se pisa.
+    SY = { url: url, token: token, pending: true, last: null };
+    syncMsg = null; saveSY(); render(); runSync('pull');
+  }
+  function syncOff() {
+    SY = null; syncMsg = null;
+    try { localStorage.removeItem(SYNC_KEY); } catch (e) { /* nada */ }
+    render();
+  }
+  window.addEventListener('online', function () { runSync('pull'); });
+  document.addEventListener('visibilitychange', function () { if (!document.hidden) runSync('pull'); });
 
   // ---------- router ----------
   function render() {
@@ -706,20 +871,23 @@
     } else if (act === 'tick') tickSet(el);
     else if (act === 'finish') finishSession();
     else if (act === 'export') doExport();
+    else if (act === 'sync-save') syncSave();
+    else if (act === 'sync-now') syncNow();
+    else if (act === 'sync-off') syncOff();
     else if (act === 'import-text') importText(document.querySelector('[data-testid="import-text"]').value);
     else if (act === 'import') document.getElementById('import-file').click();
     else if (act === 'del-session') {
       confirmModal('¿Borrar esta sesión? No se puede deshacer.', 'Borrar').then(function (ok) {
         if (!ok) return;
         S.sessions = S.sessions.filter(function (s) { return s.id !== id; });
-        save(); location.hash = '#/historial';
+        commit(); location.hash = '#/historial';
       });
     } else if (act === 'restore') {
       confirmModal('Se reemplazan tus rutinas por las originales. Tu historial se conserva. ¿Continuar?', 'Restaurar').then(function (ok) {
         if (!ok) return;
         S.routines = clone(window.SEED_ROUTINES); E = null;
         if (D) { D = null; saveDraftNow(); }
-        save(); toast('Rutinas restauradas.'); render();
+        commit(); toast('Rutinas restauradas.'); render();
       });
     } else if (E) {
       if (act === 'add-warm') E.warmup.push({ id: uid('w'), name: 'Nuevo', detail: '', note: '' });
@@ -774,4 +942,5 @@
   }
 
   render();
+  runSync('pull');
 })();
