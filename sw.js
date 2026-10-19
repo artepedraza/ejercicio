@@ -1,4 +1,4 @@
-var CACHE = 'ejt-v4';
+var CACHE = 'ejt-v5';
 var SHELL = [
   './',
   './index.html',

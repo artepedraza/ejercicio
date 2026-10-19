@@ -21,6 +21,35 @@
     return isFinite(n) && n >= 0 ? n : NaN;
   }
   function fmtN(n) { return String(n); }
+
+  // ---------- unidad de visualización (kg / lb) ----------
+  // Preferencia propia del dispositivo, FUERA de S: no sube updatedAt, no se sincroniza,
+  // no entra al respaldo ni a validate(). Los datos guardados siguen en la unidad en que se capturaron.
+  var PREFS_KEY = 'ejt:prefs', LB = 0.45359237;
+  var P = { unit: null }; // null = como se registró
+  try {
+    var pp = JSON.parse(localStorage.getItem(PREFS_KEY));
+    if (pp && (pp.unit === 'kg' || pp.unit === 'lb')) P.unit = pp.unit;
+  } catch (e) { /* sin preferencia */ }
+  function setUnitPref(u) {
+    P.unit = u;
+    try { localStorage.setItem(PREFS_KEY, JSON.stringify(P)); } catch (e) { /* nada */ }
+  }
+  function toKg(w, u) { return u === 'lb' ? w * LB : w; }
+  // Convierte para mostrar: kg a 1 decimal, lb a 0.5. Misma unidad = sin cambio.
+  function conv(w, u, to) {
+    if (w == null || !u || !to || u === to) return w;
+    var kg = toKg(w, u);
+    return to === 'kg' ? Math.round(kg * 10) / 10 : Math.round(kg / LB * 2) / 2;
+  }
+  function showUnit(u) { return u ? (P.unit || u) : u; }
+  function showW(w, u) { return conv(w, u, P.unit); }
+  function unitToggle() {
+    return '<div class="seg" role="group" aria-label="Unidad de peso"><span class="muted">Ver peso en</span>' +
+      ['kg', 'lb'].map(function (u) {
+        return '<button class="btn' + (P.unit === u ? ' primary' : '') + '" data-act="unit" data-u="' + u + '" aria-pressed="' + (P.unit === u) + '" data-testid="unit-' + u + '">' + u + '</button>';
+      }).join('') + '</div>';
+  }
   function fmtDate(iso) {
     var d = new Date(iso);
     if (isNaN(d)) return '—';
@@ -117,17 +146,30 @@
       if (!sets.length) continue;
       var hit = sets.filter(function (s) { return s.round === round; })[0];
       if (!hit) hit = sets.slice().sort(function (a, b) { return b.round - a.round; })[0];
-      var sameUnit = (hit.unit || null) === (ex.unit || null);
+      // El último peso registrado se usa tal cual, en su unidad; se convierte solo al mostrar.
+      var has = hit.weight != null;
       return {
-        weight: sameUnit ? hit.weight : ex.weight, reps: hit.reps, seconds: hit.seconds,
-        unit: hit.unit || null, text: lastText(ex, hit.weight, hit.unit, hit.reps, hit.seconds, null)
+        weight: has ? hit.weight : ex.weight, unit: has ? hit.unit || null : ex.unit || null, reps: hit.reps, seconds: hit.seconds,
+        lastRaw: { w: hit.weight, u: hit.unit || null, reps: hit.reps, seconds: hit.seconds, note: null }
       };
     }
     var hasSeed = ex.type === 'time' ? false : ex.seedReps != null;
     return {
-      weight: ex.weight, reps: hasSeed ? ex.seedReps : null, seconds: null, unit: ex.unit || null,
-      text: hasSeed ? lastText(ex, ex.weight, ex.unit, ex.seedReps, null, ex.seedNote) : null
+      weight: ex.weight, unit: ex.unit || null, reps: hasSeed ? ex.seedReps : null, seconds: null,
+      lastRaw: hasSeed ? { w: ex.weight, u: ex.unit || null, reps: ex.seedReps, seconds: null, note: ex.seedNote } : null
     };
+  }
+  function makeRow(routine, ex, round) {
+    var p = prefill(routine, ex, round);
+    return {
+      weight: p.weight, reps: p.reps, seconds: p.seconds,
+      unit: p.unit || ex.unit || (ex.type === 'weight' ? 'kg' : null), done: false, lastRaw: p.lastRaw
+    };
+  }
+  function lastTextRow(ex, row) {
+    var l = row.lastRaw;
+    if (!l) return row.last || null; // borradores anteriores guardaban el texto ya armado
+    return lastText(ex, showW(l.w, l.u), showUnit(l.u), l.reps, l.seconds, l.note);
   }
   function lastText(ex, weight, unit, reps, seconds, note) {
     var core;
@@ -229,11 +271,7 @@
     routine.blocks.forEach(function (b) {
       for (var r = 1; r <= b.rounds; r++) {
         b.exercises.forEach(function (ex) {
-          var p = prefill(routine, ex, r);
-          rows[ex.id + '|' + r] = {
-            weight: p.weight, reps: p.reps, seconds: p.seconds,
-            unit: ex.unit || (ex.type === 'weight' ? 'kg' : null), done: false, last: p.text
-          };
+          rows[ex.id + '|' + r] = makeRow(routine, ex, r);
         });
       }
     });
@@ -248,9 +286,9 @@
   function setRow(ex, r, row, sube) {
     var k = esc(ex.id) + '-' + r;
     var inputs = '';
-    var showW = ex.type === 'weight' || (ex.type === 'time' && (ex.weight != null || ex.unit));
-    if (showW) {
-      inputs += '<label>Peso (' + esc(row.unit || ex.unit || 'kg') + ')<input type="text" inputmode="decimal" pattern="[0-9]*[.,]?[0-9]*" data-in="weight" data-testid="input-weight-' + k + '" value="' + inputVal(row.weight) + '"></label>';
+    var hasW = ex.type === 'weight' || (ex.type === 'time' && (ex.weight != null || ex.unit));
+    if (hasW) {
+      inputs += '<label>Peso (' + esc(showUnit(row.unit || ex.unit || 'kg')) + ')<input type="text" inputmode="decimal" pattern="[0-9]*[.,]?[0-9]*" data-in="weight" data-testid="input-weight-' + k + '" value="' + inputVal(showW(row.weight, row.unit)) + '"></label>';
     }
     if (ex.type === 'time') {
       inputs += '<label>Segundos<input type="text" inputmode="numeric" pattern="[0-9]*" data-in="seconds" data-testid="input-seconds-' + k + '" value="' + inputVal(row.seconds) + '"></label>';
@@ -260,7 +298,7 @@
     return '<div class="set' + (row.done ? ' done' : '') + '" data-key="' + esc(ex.id) + '|' + r + '">' +
       '<div class="nm">' + esc(ex.name) + '<span class="range">' + esc(ex.min) + '–' + esc(ex.max) + (ex.type === 'time' ? ' s' : '') + '</span>' +
       (sube && r === 1 ? '<span class="badge" data-testid="badge-sube-' + esc(ex.id) + '">⬆ Sube peso</span>' : '') + '</div>' +
-      '<div class="last" data-testid="last-time-' + k + '">' + (row.last ? 'la vez pasada: ' + esc(row.last) : 'sin registro previo') + '</div>' +
+      '<div class="last" data-testid="last-time-' + k + '">' + (lastTextRow(ex, row) ? 'la vez pasada: ' + esc(lastTextRow(ex, row)) : 'sin registro previo') + '</div>' +
       '<div class="inputs">' + inputs +
       '<button class="tick" data-act="tick" data-testid="set-done-' + k + '" aria-label="Marcar serie hecha">✓</button></div></div>';
   }
@@ -277,7 +315,7 @@
       D = newDraft(routine); saveDraftNow();
     }
     var sube = subeSet(routine, lastFinished(routine.id));
-    var h = navBar() + '<h1>' + esc(routine.name) + '</h1>';
+    var h = navBar() + '<h1>' + esc(routine.name) + '</h1>' + unitToggle();
     h += '<h2>' + esc(routine.warmupTitle || 'Calentamiento') + '</h2><div class="card">';
     routine.warmup.forEach(function (w) {
       var d = [w.detail, w.note].filter(Boolean).join(' · ');
@@ -290,10 +328,7 @@
         h += '<h3>Ronda ' + r + '</h3>';
         b.exercises.forEach(function (ex) {
           var key = ex.id + '|' + r;
-          if (!D.rows[key]) {
-            var p = prefill(routine, ex, r);
-            D.rows[key] = { weight: p.weight, reps: p.reps, seconds: p.seconds, unit: ex.unit || (ex.type === 'weight' ? 'kg' : null), done: false, last: p.text };
-          }
+          if (!D.rows[key]) D.rows[key] = makeRow(routine, ex, r);
           h += setRow(ex, r, D.rows[key], !!sube[ex.id]);
         });
       }
@@ -391,7 +426,7 @@
     return order.map(function (n) {
       return '<div class="check"><span><strong>' + esc(n) + '</strong><br><span class="detail">' + groups[n].map(function (x) {
         var t = x.seconds != null ? fmtN(x.seconds) + ' s' : fmtN(x.reps) + ' reps';
-        return (x.weight != null ? fmtN(x.weight) + ' ' + esc(x.unit || '') + ' × ' : '') + t;
+        return (x.weight != null ? fmtN(showW(x.weight, x.unit)) + ' ' + esc(showUnit(x.unit) || '') + ' × ' : '') + t;
       }).map(function (t, i) { return 'R' + (i + 1) + ': ' + t; }).join(' · ') + '</span></span></div>';
     }).join('');
   }
@@ -399,7 +434,7 @@
   function topOf(sets) {
     var best = null;
     sets.forEach(function (s) {
-      var w = s.weight != null ? s.weight : -1;
+      var w = s.weight != null ? toKg(s.weight, s.unit) : -1; // en kg para comparar unidades mezcladas
       var v = s.seconds != null ? s.seconds : (s.reps || 0);
       if (!best || w > best.w || (w === best.w && v > best.v)) best = { w: w, v: v, s: s };
     });
@@ -421,7 +456,7 @@
   }
 
   function viewHistory() {
-    var h = navBar() + '<h1>Historial</h1>';
+    var h = navBar() + '<h1>Historial</h1>' + unitToggle();
     var any = false;
     S.routines.forEach(function (r) {
       var list = sessionsOf(r.id);
@@ -460,7 +495,7 @@
         var s = p.top.s;
         var t = s.seconds != null ? fmtN(s.seconds) + ' s' : fmtN(s.reps) + ' reps';
         h += '<div class="check" data-testid="progress-row"><span class="grow">' + esc(fmtDate(p.date)) + '</span><span>' +
-          (s.weight != null ? esc(fmtN(s.weight) + ' ' + (s.unit || '')) + ' × ' : '') + esc(t) + '</span></div>';
+          (s.weight != null ? esc(fmtN(showW(s.weight, s.unit)) + ' ' + (showUnit(s.unit) || '')) + ' × ' : '') + esc(t) + '</span></div>';
       });
       h += '</details>';
     });
@@ -471,7 +506,7 @@
     var s = sessionById(id);
     if (!s) { location.hash = '#/historial'; return; }
     var r = routineById(s.routineId);
-    $app.innerHTML = '<div class="nav"><a class="btn" href="#/historial">← Historial</a></div><h1>' + esc(r ? r.name : 'Sesión') + '</h1>' +
+    $app.innerHTML = '<div class="nav"><a class="btn" href="#/historial">← Historial</a></div><h1>' + esc(r ? r.name : 'Sesión') + '</h1>' + unitToggle() +
       '<p class="muted">' + esc(fmtDate(s.date)) + '</p><div class="card">' + (sessionSetsText(s) || '<span class="muted">Sin series registradas.</span>') + '</div>' +
       '<button class="btn danger big" data-act="del-session" data-id="' + esc(s.id) + '" data-testid="delete-session-' + esc(s.id) + '">Borrar sesión</button>';
   }
@@ -868,7 +903,8 @@
           if (ok) { D = null; saveDraftNow(); location.hash = '#/sesion/' + id; }
         });
       } else location.hash = '#/sesion/' + id;
-    } else if (act === 'tick') tickSet(el);
+    } else if (act === 'unit') { setUnitPref(el.getAttribute('data-u')); render(); }
+    else if (act === 'tick') tickSet(el);
     else if (act === 'finish') finishSession();
     else if (act === 'export') doExport();
     else if (act === 'sync-save') syncSave();
@@ -912,6 +948,8 @@
     var n = parseNum(el.value);
     el.classList.toggle('bad', Number.isNaN(n));
     row[field] = Number.isNaN(n) ? null : n;
+    // Lo que se teclea queda en la unidad que se está viendo; sin editar, la fila conserva peso y unidad originales.
+    if (field === 'weight') row.unit = P.unit || row.unit;
     saveDraftSoon();
   });
 
