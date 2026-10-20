@@ -79,3 +79,7 @@ details summary { min-height: 48px; display: flex; align-items: center; cursor: 
 .seg { display: flex; gap: 8px; align-items: center; margin: 0 0 8px; }
 .seg .muted { flex: 1; }
 .seg .btn { min-width: 64px; }
+.set .top { display: flex; gap: 8px; align-items: flex-start; justify-content: space-between; }
+.set .top .nm { flex: 1; min-width: 0; }
+.set .seg { flex: none; gap: 4px; margin: 0; }
+.set .seg .btn { min-height: 44px; min-width: 44px; padding: 0 8px; }

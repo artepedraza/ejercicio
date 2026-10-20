@@ -22,19 +22,10 @@
   }
   function fmtN(n) { return String(n); }
 
-  // ---------- unidad de visualización (kg / lb) ----------
-  // Preferencia propia del dispositivo, FUERA de S: no sube updatedAt, no se sincroniza,
-  // no entra al respaldo ni a validate(). Los datos guardados siguen en la unidad en que se capturaron.
-  var PREFS_KEY = 'ejt:prefs', LB = 0.45359237;
-  var P = { unit: null }; // null = como se registró
-  try {
-    var pp = JSON.parse(localStorage.getItem(PREFS_KEY));
-    if (pp && (pp.unit === 'kg' || pp.unit === 'lb')) P.unit = pp.unit;
-  } catch (e) { /* sin preferencia */ }
-  function setUnitPref(u) {
-    P.unit = u;
-    try { localStorage.setItem(PREFS_KEY, JSON.stringify(P)); } catch (e) { /* nada */ }
-  }
+  // ---------- unidad por ejercicio (kg / lb) ----------
+  // La elección vive en S.exUnits = { [exId]: 'kg'|'lb' } (estado sincronizado). Los sets siguen guardando peso+unidad como se capturaron;
+  // la conversión es solo al mostrar. Sin elección: unidad del último set registrado del ejercicio, luego ex.unit, luego kg.
+  var LB = 0.45359237;
   function toKg(w, u) { return u === 'lb' ? w * LB : w; }
   // Convierte para mostrar: kg a 1 decimal, lb a 0.5. Misma unidad = sin cambio.
   function conv(w, u, to) {
@@ -42,14 +33,7 @@
     var kg = toKg(w, u);
     return to === 'kg' ? Math.round(kg * 10) / 10 : Math.round(kg / LB * 2) / 2;
   }
-  function showUnit(u) { return u ? (P.unit || u) : u; }
-  function showW(w, u) { return conv(w, u, P.unit); }
-  function unitToggle() {
-    return '<div class="seg" role="group" aria-label="Unidad de peso"><span class="muted">Ver peso en</span>' +
-      ['kg', 'lb'].map(function (u) {
-        return '<button class="btn' + (P.unit === u ? ' primary' : '') + '" data-act="unit" data-u="' + u + '" aria-pressed="' + (P.unit === u) + '" data-testid="unit-' + u + '">' + u + '</button>';
-      }).join('') + '</div>';
-  }
+  function showUnit(u, to) { return u && to ? to : u; }
   function fmtDate(iso) {
     var d = new Date(iso);
     if (isNaN(d)) return '—';
@@ -69,9 +53,10 @@
   var S, D = null;
 
   var EPOCH = '1970-01-01T00:00:00.000Z'; // updatedAt de un estado nunca editado (semilla)
-  function seedState() { return { v: VERSION, updatedAt: EPOCH, routines: clone(window.SEED_ROUTINES), sessions: [] }; }
+  function seedState() { return { v: VERSION, updatedAt: EPOCH, routines: clone(window.SEED_ROUTINES), sessions: [], exUnits: {} }; }
   function migrate(st) {
     st.v = VERSION;
+    if (!st.exUnits || typeof st.exUnits !== 'object' || Array.isArray(st.exUnits)) st.exUnits = {};
     if (typeof st.updatedAt !== 'string' || isNaN(new Date(st.updatedAt))) {
       var last = EPOCH;
       (st.sessions || []).forEach(function (s) { if (typeof s.date === 'string' && s.date > last) last = s.date; });
@@ -159,6 +144,24 @@
       lastRaw: hasSeed ? { w: ex.weight, u: ex.unit || null, reps: ex.seedReps, seconds: null, note: ex.seedNote } : null
     };
   }
+  // Unidad en que se ve un ejercicio: elección > último set con unidad > unidad configurada > kg.
+  function exUnit(routine, ex) {
+    var c = S.exUnits[ex.id];
+    if (c === 'kg' || c === 'lb') return c;
+    var sessions = sessionsOf(routine.id);
+    for (var i = 0; i < sessions.length; i++) {
+      var sets = setsFor(sessions[i], ex).filter(function (s) { return s.weight != null && s.unit; });
+      if (sets.length) return sets[sets.length - 1].unit;
+    }
+    return ex.unit || 'kg';
+  }
+  // Para historial: unidad de un ejercicio por id/nombre; null si ya no está en la rutina (se muestra como se registró).
+  function unitByName(routine, exId, exName) {
+    if (!routine) return null;
+    var ex = allExercises(routine).filter(function (e) { return e.id === exId || (!exId && e.name === exName); })[0] ||
+      allExercises(routine).filter(function (e) { return e.name === exName; })[0];
+    return ex ? exUnit(routine, ex) : null;
+  }
   function makeRow(routine, ex, round) {
     var p = prefill(routine, ex, round);
     return {
@@ -166,10 +169,10 @@
       unit: p.unit || ex.unit || (ex.type === 'weight' ? 'kg' : null), done: false, lastRaw: p.lastRaw
     };
   }
-  function lastTextRow(ex, row) {
+  function lastTextRow(ex, row, to) {
     var l = row.lastRaw;
     if (!l) return row.last || null; // borradores anteriores guardaban el texto ya armado
-    return lastText(ex, showW(l.w, l.u), showUnit(l.u), l.reps, l.seconds, l.note);
+    return lastText(ex, conv(l.w, l.u, to), showUnit(l.u, to), l.reps, l.seconds, l.note);
   }
   function lastText(ex, weight, unit, reps, seconds, note) {
     var core;
@@ -283,12 +286,12 @@
 
   function inputVal(v) { return v == null ? '' : esc(fmtN(v)); }
 
-  function setRow(ex, r, row, sube) {
+  function setRow(ex, r, row, sube, u) {
     var k = esc(ex.id) + '-' + r;
     var inputs = '';
     var hasW = ex.type === 'weight' || (ex.type === 'time' && (ex.weight != null || ex.unit));
     if (hasW) {
-      inputs += '<label>Peso (' + esc(showUnit(row.unit || ex.unit || 'kg')) + ')<input type="text" inputmode="decimal" pattern="[0-9]*[.,]?[0-9]*" data-in="weight" data-testid="input-weight-' + k + '" value="' + inputVal(showW(row.weight, row.unit)) + '"></label>';
+      inputs += '<label>Peso (' + esc(u) + ')<input type="text" inputmode="decimal" pattern="[0-9]*[.,]?[0-9]*" data-in="weight" data-testid="input-weight-' + k + '" value="' + inputVal(conv(row.weight, row.unit, u)) + '"></label>';
     }
     if (ex.type === 'time') {
       inputs += '<label>Segundos<input type="text" inputmode="numeric" pattern="[0-9]*" data-in="seconds" data-testid="input-seconds-' + k + '" value="' + inputVal(row.seconds) + '"></label>';
@@ -296,9 +299,12 @@
       inputs += '<label>Reps<input type="text" inputmode="numeric" pattern="[0-9]*" data-in="reps" data-testid="input-reps-' + k + '" value="' + inputVal(row.reps) + '"></label>';
     }
     return '<div class="set' + (row.done ? ' done' : '') + '" data-key="' + esc(ex.id) + '|' + r + '">' +
-      '<div class="nm">' + esc(ex.name) + '<span class="range">' + esc(ex.min) + '–' + esc(ex.max) + (ex.type === 'time' ? ' s' : '') + '</span>' +
+      '<div class="top"><div class="nm">' + esc(ex.name) + '<span class="range">' + esc(ex.min) + '–' + esc(ex.max) + (ex.type === 'time' ? ' s' : '') + '</span>' +
       (sube && r === 1 ? '<span class="badge" data-testid="badge-sube-' + esc(ex.id) + '">⬆ Sube peso</span>' : '') + '</div>' +
-      '<div class="last" data-testid="last-time-' + k + '">' + (lastTextRow(ex, row) ? 'la vez pasada: ' + esc(lastTextRow(ex, row)) : 'sin registro previo') + '</div>' +
+      (hasW ? '<div class="seg" role="group" aria-label="Unidad de ' + esc(ex.name) + '">' + ['kg', 'lb'].map(function (x) {
+        return '<button class="btn' + (u === x ? ' primary' : '') + '" data-act="exunit" data-ex="' + esc(ex.id) + '" data-u="' + x + '" aria-pressed="' + (u === x) + '" data-testid="exunit-' + k + '-' + x + '">' + x + '</button>';
+      }).join('') + '</div>' : '') + '</div>' +
+      '<div class="last" data-testid="last-time-' + k + '">' + (lastTextRow(ex, row, u) ? 'la vez pasada: ' + esc(lastTextRow(ex, row, u)) : 'sin registro previo') + '</div>' +
       '<div class="inputs">' + inputs +
       '<button class="tick" data-act="tick" data-testid="set-done-' + k + '" aria-label="Marcar serie hecha">✓</button></div></div>';
   }
@@ -315,7 +321,9 @@
       D = newDraft(routine); saveDraftNow();
     }
     var sube = subeSet(routine, lastFinished(routine.id));
-    var h = navBar() + '<h1>' + esc(routine.name) + '</h1>' + unitToggle();
+    var exU = {};
+    allExercises(routine).forEach(function (ex) { exU[ex.id] = exUnit(routine, ex); });
+    var h = navBar() + '<h1>' + esc(routine.name) + '</h1>';
     h += '<h2>' + esc(routine.warmupTitle || 'Calentamiento') + '</h2><div class="card">';
     routine.warmup.forEach(function (w) {
       var d = [w.detail, w.note].filter(Boolean).join(' · ');
@@ -329,7 +337,7 @@
         b.exercises.forEach(function (ex) {
           var key = ex.id + '|' + r;
           if (!D.rows[key]) D.rows[key] = makeRow(routine, ex, r);
-          h += setRow(ex, r, D.rows[key], !!sube[ex.id]);
+          h += setRow(ex, r, D.rows[key], !!sube[ex.id], exU[ex.id]);
         });
       }
     });
@@ -417,16 +425,17 @@
     $app.innerHTML = h;
   }
 
-  function sessionSetsText(s) {
+  function sessionSetsText(s, routine) {
     var groups = {}, order = [];
     s.sets.forEach(function (x) {
       if (!groups[x.exName]) { groups[x.exName] = []; order.push(x.exName); }
       groups[x.exName].push(x);
     });
     return order.map(function (n) {
+      var u = unitByName(routine, groups[n][0].exId, n);
       return '<div class="check"><span><strong>' + esc(n) + '</strong><br><span class="detail">' + groups[n].map(function (x) {
         var t = x.seconds != null ? fmtN(x.seconds) + ' s' : fmtN(x.reps) + ' reps';
-        return (x.weight != null ? fmtN(showW(x.weight, x.unit)) + ' ' + esc(showUnit(x.unit) || '') + ' × ' : '') + t;
+        return (x.weight != null ? fmtN(conv(x.weight, x.unit, u)) + ' ' + esc(showUnit(x.unit, u) || '') + ' × ' : '') + t;
       }).map(function (t, i) { return 'R' + (i + 1) + ': ' + t; }).join(' · ') + '</span></span></div>';
     }).join('');
   }
@@ -456,7 +465,7 @@
   }
 
   function viewHistory() {
-    var h = navBar() + '<h1>Historial</h1>' + unitToggle();
+    var h = navBar() + '<h1>Historial</h1>';
     var any = false;
     S.routines.forEach(function (r) {
       var list = sessionsOf(r.id);
@@ -475,19 +484,19 @@
 
   // Progreso por ejercicio dentro de una rutina (no se mezcla entre rutinas)
   function progressHtml(routineId) {
-    var byName = {}, names = [];
+    var byName = {}, names = [], exIdOf = {}, routine = routineById(routineId);
     sessionsOf(routineId).slice().sort(function (a, b) { return a.date < b.date ? -1 : 1; }).forEach(function (s) {
       var g = {};
       s.sets.forEach(function (x) { (g[x.exName] = g[x.exName] || []).push(x); });
       Object.keys(g).forEach(function (n) {
-        if (!byName[n]) { byName[n] = []; names.push(n); }
+        if (!byName[n]) { byName[n] = []; names.push(n); exIdOf[n] = g[n][0].exId; }
         byName[n].push({ date: s.date, top: topOf(g[n]) });
       });
     });
     if (!names.length) return '';
     var h = '<h3>Progreso</h3>';
     names.sort().forEach(function (n) {
-      var pts = byName[n];
+      var pts = byName[n], u = unitByName(routine, exIdOf[n], n);
       var useW = pts.some(function (p) { return p.top.w >= 0; });
       var vals = pts.map(function (p) { return useW ? Math.max(p.top.w, 0) : p.top.v; });
       h += '<details open class="card" data-testid="progress-' + esc(routineId) + '-' + esc(slug(n)) + '"><summary><span class="grow"><strong>' + esc(n) + '</strong></span>' + spark(vals) + '</summary>';
@@ -495,7 +504,7 @@
         var s = p.top.s;
         var t = s.seconds != null ? fmtN(s.seconds) + ' s' : fmtN(s.reps) + ' reps';
         h += '<div class="check" data-testid="progress-row"><span class="grow">' + esc(fmtDate(p.date)) + '</span><span>' +
-          (s.weight != null ? esc(fmtN(showW(s.weight, s.unit)) + ' ' + (showUnit(s.unit) || '')) + ' × ' : '') + esc(t) + '</span></div>';
+          (s.weight != null ? esc(fmtN(conv(s.weight, s.unit, u)) + ' ' + (showUnit(s.unit, u) || '')) + ' × ' : '') + esc(t) + '</span></div>';
       });
       h += '</details>';
     });
@@ -506,8 +515,8 @@
     var s = sessionById(id);
     if (!s) { location.hash = '#/historial'; return; }
     var r = routineById(s.routineId);
-    $app.innerHTML = '<div class="nav"><a class="btn" href="#/historial">← Historial</a></div><h1>' + esc(r ? r.name : 'Sesión') + '</h1>' + unitToggle() +
-      '<p class="muted">' + esc(fmtDate(s.date)) + '</p><div class="card">' + (sessionSetsText(s) || '<span class="muted">Sin series registradas.</span>') + '</div>' +
+    $app.innerHTML = '<div class="nav"><a class="btn" href="#/historial">← Historial</a></div><h1>' + esc(r ? r.name : 'Sesión') + '</h1>' + 
+      '<p class="muted">' + esc(fmtDate(s.date)) + '</p><div class="card">' + (sessionSetsText(s, r) || '<span class="muted">Sin series registradas.</span>') + '</div>' +
       '<button class="btn danger big" data-act="del-session" data-id="' + esc(s.id) + '" data-testid="delete-session-' + esc(s.id) + '">Borrar sesión</button>';
   }
 
@@ -554,7 +563,7 @@
           '<div class="grid2">' + fld('Mín', p + 'min', x.min, 'edit-ex-min-' + x.id, 'inputmode="numeric"') +
           fld('Máx', p + 'max', x.max, 'edit-ex-max-' + x.id, 'inputmode="numeric"') + '</div>' +
           '<div class="grid2">' + fld('Peso inicial', p + 'weight', x.weight, 'edit-ex-weight-' + x.id, 'inputmode="decimal"') +
-          '<label class="field"><span>Unidad</span><select data-bind="' + p + 'unit" data-testid="edit-ex-unit-' + esc(x.id) + '">' +
+          '<label class="field"><span>Unidad inicial</span><select data-bind="' + p + 'unit" data-testid="edit-ex-unit-' + esc(x.id) + '">' +
           [['', '—'], ['kg', 'kg'], ['lb', 'lb']].map(function (o) {
             return '<option value="' + o[0] + '"' + ((x.unit || '') === o[0] ? ' selected' : '') + '>' + o[1] + '</option>';
           }).join('') + '</select></label></div>' +
@@ -694,6 +703,10 @@
         }
       }
     }
+    if (st.exUnits !== undefined) {
+      if (!st.exUnits || typeof st.exUnits !== 'object' || Array.isArray(st.exUnits)) return 'Unidades por ejercicio inválidas.';
+      for (var ek in st.exUnits) if (st.exUnits[ek] !== 'kg' && st.exUnits[ek] !== 'lb') return 'Unidades por ejercicio inválidas.';
+    }
     var sids = {};
     for (var s = 0; s < st.sessions.length; s++) {
       var se = st.sessions[s];
@@ -792,7 +805,10 @@
     var have = {};
     S.sessions.forEach(function (s) { have[s.id] = 1; });
     remote.sessions.forEach(function (s) { if (!have[s.id]) S.sessions.push(s); });
-    if (remote.updatedAt > S.updatedAt) S.routines = remote.routines;
+    // exUnits: unión de ambas; si hay choque gana el lado más nuevo (igual que las rutinas).
+    var rx = remote.exUnits || {};
+    if (remote.updatedAt > S.updatedAt) { S.routines = remote.routines; S.exUnits = Object.assign({}, S.exUnits, rx); }
+    else S.exUnits = Object.assign({}, rx, S.exUnits);
     S.updatedAt = new Date().toISOString();
     rev++;
     save();
@@ -903,7 +919,12 @@
           if (ok) { D = null; saveDraftNow(); location.hash = '#/sesion/' + id; }
         });
       } else location.hash = '#/sesion/' + id;
-    } else if (act === 'unit') { setUnitPref(el.getAttribute('data-u')); render(); }
+    } else if (act === 'exunit') {
+      S.exUnits[el.getAttribute('data-ex')] = el.getAttribute('data-u');
+      commit();
+      var y = window.scrollY;
+      if (D && /^#\/sesion\//.test(location.hash)) { viewSession(D.routineId); window.scrollTo(0, y); } else render();
+    }
     else if (act === 'tick') tickSet(el);
     else if (act === 'finish') finishSession();
     else if (act === 'export') doExport();
@@ -948,8 +969,12 @@
     var n = parseNum(el.value);
     el.classList.toggle('bad', Number.isNaN(n));
     row[field] = Number.isNaN(n) ? null : n;
-    // Lo que se teclea queda en la unidad que se está viendo; sin editar, la fila conserva peso y unidad originales.
-    if (field === 'weight') row.unit = P.unit || row.unit;
+    // Lo que se teclea queda en la unidad del ejercicio; sin editar, la fila conserva peso y unidad originales.
+    if (field === 'weight') {
+      var exId = set.getAttribute('data-key').split('|')[0], rt = routineById(D.routineId);
+      var xe = rt && allExercises(rt).filter(function (e) { return e.id === exId; })[0];
+      if (xe) row.unit = exUnit(rt, xe);
+    }
     saveDraftSoon();
   });
 
